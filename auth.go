@@ -25,6 +25,8 @@ var disableUserInfo = false
 
 var whitelist []string
 var blacklist []string // TODO Refactor to struct with expiration time, and add cleaner.
+var groupsClaimName string
+var authorizedGroups []string
 
 type blacklistItem struct {
 	Key        string    `json:"key"`
@@ -67,6 +69,13 @@ func init() {
 	envContent = os.Getenv("DISABLE_USERINFO")
 	if envContent == "true" {
 		disableUserInfo = true
+	}
+
+	groupsClaimName = getenvOrDefault("OIDC_GROUPS_CLAIM_NAME", "groups")
+
+	authorizedGroups = strings.Split(getenvOrDefault("AUTHORIZED_GROUPS", ""), " ")
+	if len(authorizedGroups) > 0 {
+		log.Println("Authorized groups:", authorizedGroups)
 	}
 }
 
@@ -151,7 +160,45 @@ func AuthReqHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var uifClaimMap map[string]interface{}
+	if err := json.Unmarshal(uifClaim, &uifClaimMap); err != nil {
+		log.Println(getUserIP(r), r.URL.String(), "unable to unmarshal user info claim", err.Error())
+		returnStatus(w, http.StatusBadRequest, "Malformed cookie or header.")
+		return
+	}
+
+	groupsMatched := false
+	for _, group := range authorizedGroups {
+		groupsClaim, ok := uifClaimMap[groupsClaimName].([]interface{})
+		if !ok {
+			break
+		}
+
+		for _, groupClaim := range groupsClaim {
+			if groupClaim.(string) == group {
+				groupsMatched = true
+				break
+			}
+		}
+	}
+
+	if len(authorizedGroups) > 0 && !groupsMatched {
+		log.Println(getUserIP(r), r.URL.String(), authorizedGroups, "not found in", uifClaimMap[groupsClaimName])
+		returnStatus(w, http.StatusForbidden, "Unauthorized")
+		return
+	}
+
 	log.Println(getUserIP(r), r.URL.String(), "Authorized & accepted.")
+
+	// the following two headers are used by Grafana via Auth Proxy
+	// https://grafana.com/docs/auth/auth-proxy/
+	if val, ok := uifClaimMap["name"].(string); ok {
+		w.Header().Set("X-AUTH-USER", val)
+	}
+	if val, ok := uifClaimMap["email"].(string); ok {
+		w.Header().Set("X-AUTH-EMAIL", val)
+	}
+
 	w.Header().Set("X-Auth-Userinfo", string(uifClaim[:]))
 	returnStatus(w, http.StatusOK, "OK")
 }
